@@ -580,11 +580,11 @@ This is planned for future releases.
 If you use this code in your research, please cite our paper:
 
 ```bibtex
-@article{mixandmatch2024,
-  title={Mix-and-Match Pruning: A Sensitivity-Driven Multi-Strategy Framework for Neural Network Compression},
-  author={[Authors]},
-  journal={[Journal/Conference]},
-  year={2024}
+@article{monachan2026mix,
+  title={Mix-and-match pruning: Globally guided layer-wise sparsification of dnns},
+  author={Monachan, Danial and Nazari, Samira and Taheri, Mahdi and Azarpeyvand, Ali and Krstic, Milos and Huebner, Michael and Herglotz, Christian},
+  journal={arXiv preprint arXiv:2603.20280},
+  year={2026}
 }
 ```
 
