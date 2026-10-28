@@ -286,6 +286,7 @@ def fine_tune_model(model, masks, train_loader, val_loader, device, epochs=20):
             output = model(data)
             loss = criterion(output, target)
             loss.backward()
+            optimizer.step()
 
             # Enforce sparsity after gradient update
             with torch.no_grad():
@@ -294,8 +295,6 @@ def fine_tune_model(model, masks, train_loader, val_loader, device, epochs=20):
                         mask = masks[name]
                         if mask.numel() == param.numel():
                             param.data.mul_(mask.view(param.shape).to(param.device))
-
-            optimizer.step()
 
         # Validation
         model.eval()
@@ -489,6 +488,7 @@ def main():
         # Fine-tune
         ft_acc = fine_tune_model(model, masks, train_loader, val_loader, device, epochs=args.epochs)
         print(f"  Fine-tuned FP32 Accuracy: {ft_acc:.2f}%")
+        print(f"  Sparsity after fine-tuning: {calculate_sparsity(model):.2f}%")
 
         # Apply PTQ
         model_int8 = apply_ptq(copy.deepcopy(model).cpu(), val_loader, 'cpu')
