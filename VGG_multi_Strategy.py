@@ -15,11 +15,11 @@ import torch.nn as nn
 import torch.quantization
 import torchvision.transforms as transforms
 from torchvision import datasets
-from torch.utils.data import DataLoader
-import timm
+from torch.utils.data import DataLoader, Subset
 import numpy as np
 import copy
 import csv
+import hashlib
 import json
 import os
 from typing import List, Dict, Tuple
@@ -36,20 +36,30 @@ from benchmarking.unstructured.classical.magnitude import MagnitudePruning
 from benchmarking.unstructured.classical.random import RandomPruning
 from benchmarking.unstructured.y2019.snip import SNIPPruning, GraSPPruning
 
+# Model definitions (features.*, classifier.0/3/6)
+from core.models import vgg11_bn
+
 # Configuration
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_FINE_TUNE_EPOCHS = 20
+DEFAULT_HELDOUT_SIZE = 5000
 SEED = 42
 
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-np.random.seed(SEED)
-random.seed(SEED)
+MODELS = {'vgg11_bn': vgg11_bn}
+
+def set_seed(seed):
+    """Seed all random number generators"""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='VGG-11 Multi-Strategy Pruning on CIFAR-10')
+    parser.add_argument('--model', type=str, default='vgg11_bn', choices=sorted(MODELS),
+                        help='Model architecture from core/models.py (default: vgg11_bn)')
     parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to pretrained VGG-11 checkpoint (.pt or .pth file)')
+                        help='Path to pretrained VGG-11 checkpoint (.pt or .pth file), loaded with strict=True')
     parser.add_argument('--score_dir', type=str, required=True,
                         help='Directory containing sensitivity scores')
     parser.add_argument('--data_path', type=str, default='./data',
@@ -62,9 +72,32 @@ def parse_args():
                         help='Device to use: cuda or cpu (default: cuda if available)')
     parser.add_argument('--output_dir', type=str, default='pruned_models/vgg',
                         help='Directory to save pruned models (default: pruned_models/vgg)')
+    parser.add_argument('--seed', type=int, default=SEED,
+                        help=f'Random seed (default: {SEED})')
+    parser.add_argument('--ratios', type=str, default=None,
+                        help='Optional comma-separated pruning percentages (0-100), one per prunable layer, '
+                             'in the layer order printed by this script. Runs this single custom strategy '
+                             'instead of the default strategy list.')
+    parser.add_argument('--val_split', type=str, default='test', choices=['test', 'heldout'],
+                        help='Split used for validation, early stopping and PTQ calibration: '
+                             'test = CIFAR-10 test set (default); heldout = seeded split of the training set')
+    parser.add_argument('--heldout_size', type=int, default=DEFAULT_HELDOUT_SIZE,
+                        help=f'Training images held out for validation with --val_split heldout '
+                             f'(default: {DEFAULT_HELDOUT_SIZE})')
+    parser.add_argument('--subset_size', type=int, default=None,
+                        help='Smoke tests only: use the first N images of each split (default: all)')
     return parser.parse_args()
 
-def load_data(data_path, batch_size):
+def heldout_split(num_train, heldout_size, seed):
+    """Seeded split of training indices into (train, heldout)"""
+    if not 0 < heldout_size < num_train:
+        raise ValueError(f"--heldout_size must be between 1 and {num_train - 1}, got {heldout_size}")
+    generator = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(num_train, generator=generator).tolist()
+    return perm[heldout_size:], perm[:heldout_size]
+
+def load_data(data_path, batch_size, val_split='test', heldout_size=DEFAULT_HELDOUT_SIZE,
+              seed=SEED, subset_size=None):
     """Load CIFAR-10 data"""
     print("Loading CIFAR-10 data...")
 
@@ -81,7 +114,21 @@ def load_data(data_path, batch_size):
     ])
 
     train_dataset = datasets.CIFAR10(root=data_path, train=True, download=True, transform=train_transform)
-    val_dataset = datasets.CIFAR10(root=data_path, train=False, download=True, transform=val_transform)
+    if val_split == 'test':
+        val_dataset = datasets.CIFAR10(root=data_path, train=False, download=True, transform=val_transform)
+    else:
+        # Validation images come from the training set, without augmentation
+        heldout_source = datasets.CIFAR10(root=data_path, train=True, download=True, transform=val_transform)
+        train_idx, heldout_idx = heldout_split(len(train_dataset), heldout_size, seed)
+        train_dataset = Subset(train_dataset, train_idx)
+        val_dataset = Subset(heldout_source, heldout_idx)
+        print(f"  Held-out validation: {len(val_dataset)} training images (seed {seed}), "
+              f"{len(train_dataset)} left for fine-tuning")
+
+    if subset_size is not None:
+        train_dataset = Subset(train_dataset, range(min(subset_size, len(train_dataset))))
+        val_dataset = Subset(val_dataset, range(min(subset_size, len(val_dataset))))
+        print(f"  Subset: {len(train_dataset)} train / {len(val_dataset)} validation images")
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
@@ -375,13 +422,27 @@ def apply_ptq(model, val_loader, device):
     torch.quantization.convert(model, inplace=True)
     return model
 
+def parse_ratios(ratios: str, layer_names: List[str]) -> List[float]:
+    """Parse --ratios into one pruning percentage per prunable layer"""
+    values = [float(v) for v in ratios.split(',') if v.strip()]
+    if len(values) != len(layer_names):
+        raise ValueError(f"--ratios has {len(values)} values, expected {len(layer_names)} "
+                         f"(one per prunable layer, in this order: {', '.join(layer_names)})")
+    for name, value in zip(layer_names, values):
+        if not 0.0 <= value <= 100.0:
+            raise ValueError(f"--ratios value for {name} must be between 0 and 100, got {value}")
+    return values
+
 def main():
     args = parse_args()
+    set_seed(args.seed)
 
     print("=" * 80)
     print("VGG-11 Multi-Strategy Pruning with PTQ (CIFAR-10)")
+    print(f"Model: {args.model}")
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Score Directory: {args.score_dir}")
+    print(f"Seed: {args.seed} | Validation split: {args.val_split}")
     print("=" * 80)
 
     # Setup device
@@ -397,21 +458,20 @@ def main():
     savepoint = json.load(open(savepoint_file)) if os.path.exists(savepoint_file) else {'completed': []}
 
     # Load data
-    train_loader, val_loader = load_data(args.data_path, args.batch_size)
+    train_loader, val_loader = load_data(args.data_path, args.batch_size, args.val_split,
+                                         args.heldout_size, args.seed, args.subset_size)
 
     # Load model
     print(f"\nLoading pretrained VGG-11 from: {args.checkpoint}")
     if not os.path.exists(args.checkpoint):
         raise FileNotFoundError(
             f"Checkpoint not found at: {args.checkpoint}\n"
-            f"Please provide a pretrained VGG-11 checkpoint.\n"
-            f"You can:\n"
-            f"  1. Train your own VGG-11 on CIFAR-10\n"
-            f"  2. Use timm pretrained: python -c 'import timm; m=timm.create_model(\"vgg11_bn\", pretrained=True, num_classes=10); import torch; torch.save(m.state_dict(), \"{args.checkpoint}\")'"
+            f"Please provide a pretrained VGG-11 checkpoint with the state_dict keys of\n"
+            f"core/models.py vgg11_bn (features.*, classifier.0/3/6), e.g. a VGG-11 trained on CIFAR-10."
         )
 
     # Create model
-    base_model = timm.create_model('vgg11_bn', pretrained=False, num_classes=10)
+    base_model = MODELS[args.model](pretrained=False, device=device, num_classes=10)
 
     # Load checkpoint
     checkpoint = torch.load(args.checkpoint, map_location=device)
@@ -424,7 +484,7 @@ def main():
     else:
         state_dict = checkpoint
 
-    base_model.load_state_dict(state_dict, strict=False)
+    base_model.load_state_dict(state_dict, strict=True)
     base_model = base_model.to(device)
 
     initial_acc = evaluate_model(base_model, val_loader, device)
@@ -435,7 +495,7 @@ def main():
         raise FileNotFoundError(
             f"Sensitivity score directory not found: {args.score_dir}\n"
             f"Please run the sensitivity score generation first:\n"
-            f"  python vgg_sensitivity_simple.py --checkpoint {args.checkpoint} --score_dir {args.score_dir}"
+            f"  python vgg_sensitivity_simple.py --checkpoint {args.checkpoint} --output_dir {args.score_dir}"
         )
 
     # Get layer information
@@ -443,6 +503,7 @@ def main():
     layer_ranges = compute_vgg_sparsity_ranges(layer_names, layer_params)
 
     print(f"\nFound {len(layer_names)} prunable layers with sensitivity scores")
+    print(f"Layer order (for --ratios): {', '.join(layer_names)}")
 
     # Define strategies to test
     strategy_types = [
@@ -451,6 +512,10 @@ def main():
         "upper_70th_percentile", "upper_90th_percentile",
         "random", "random", "random"  # 3 random variants for diversity
     ]
+    custom_ratios = None
+    if args.ratios is not None:
+        custom_ratios = parse_ratios(args.ratios, layer_names)
+        strategy_types = ["custom"]
 
     results = []
 
@@ -460,6 +525,9 @@ def main():
 
     for idx, strategy_type in enumerate(strategy_types, 1):
         strategy_id = f"strategy_{idx}_{strategy_type}"
+        if custom_ratios is not None:
+            # Distinct id per ratio vector, so savepoint resume never mixes two custom runs
+            strategy_id += "_" + hashlib.sha256(",".join(f"{r:g}" for r in custom_ratios).encode()).hexdigest()[:8]
         print(f"\nStrategy {idx}/{len(strategy_types)}: {strategy_type}")
 
         # Skip if already completed (savepoint resume)
@@ -474,7 +542,11 @@ def main():
             continue
 
         # Create strategy
-        strategy, desc = create_strategy_variant(layer_names, layer_params, layer_ranges, strategy_type)
+        if custom_ratios is not None:
+            strategy = list(custom_ratios)
+            desc = "custom (" + ", ".join(f"{n}={r:g}" for n, r in zip(layer_names, custom_ratios)) + ")"
+        else:
+            strategy, desc = create_strategy_variant(layer_names, layer_params, layer_ranges, strategy_type)
 
         # Create a fresh model copy
         model = copy.deepcopy(base_model)
