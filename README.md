@@ -95,9 +95,10 @@ python -c "from core.models import vgg11_bn; print('✓ Core imports successful'
 import timm
 import torch
 
-# For VGG-11 on CIFAR-10
-model = timm.create_model('vgg11_bn', pretrained=True, num_classes=10)
-torch.save(model.state_dict(), 'checkpoints/vgg11_cifar10.pth')
+# For VGG-11 on CIFAR-10: not available from timm. VGG_multi_Strategy.py and
+# vgg_sensitivity_simple.py use core/models.py vgg11_bn (features.*, classifier.0/3/6)
+# and load the checkpoint with strict=True, so timm's vgg11_bn weights do not load.
+# Train core.models.vgg11_bn(num_classes=10) on CIFAR-10 and save its state_dict.
 
 # For ResNet-18
 model = timm.create_model('resnet18', pretrained=True, num_classes=43)  # GTSRB has 43 classes
@@ -126,7 +127,7 @@ Before pruning, you must generate sensitivity scores for each layer:
 # Example for VGG-11 (replace with your checkpoint path)
 python vgg_sensitivity_simple.py \
     --checkpoint checkpoints/vgg11_cifar10.pth \
-    --score_dir ./vgg_scores \
+    --output_dir ./vgg_scores \
     --data_path ./data
 ```
 
@@ -188,12 +189,26 @@ Automatically downloaded by torchvision on first run. No manual setup required.
 ```bash
 python vgg_sensitivity_simple.py \
     --checkpoint checkpoints/vgg11_cifar10.pth \
-    --score_dir ./vgg_scores \
-    --data_path ./data \
-    --batch_size 128
+    --output_dir ./vgg_scores \
+    --data_path ./data
 ```
 
-**Expected runtime:** ~30-60 minutes on GPU
+Same method and CSV format as `resnet_sensitivity_simple.py`: the gradient is the mean of |∂L/∂w| over `--num_batches` batches, and the script writes one `weight_sensitivity_scores_<layer>.weight.csv` (columns `index,sensitivity_score`) per Conv2d/Linear weight (11 files for VGG-11). Non-finite scores are written as 0, as in the other sensitivity scripts; the script prints a warning with the count per layer when that happens.
+
+**Arguments:**
+- `--checkpoint` (required): Path to pretrained VGG-11 checkpoint, loaded with `strict=True` into `core/models.py` `vgg11_bn`
+- `--model` (optional): Model from `core/models.py` (default: `vgg11_bn`)
+- `--data_path` (optional): Path to CIFAR-10 data (default: `./data`)
+- `--output_dir` (optional, alias `--score_dir`): Directory for the score CSVs (default: `vgg_weight_sensitivity_score`)
+- `--metric` (optional): `product` (|w|·|g|), `magnitude` (|w|) or `gradient` (|g|) (default: `product`)
+- `--batch_size` (optional): Batch size (default: 32)
+- `--num_batches` (optional): Batches to accumulate gradients over (default: 50)
+- `--device` (optional): `cuda` or `cpu` (default: `cuda` if available)
+- `--seed` (optional): Random seed for the batch order (default: 42)
+- `--val_split` (optional): Images for the gradient pass: `test` (CIFAR-10 test set, default) or `heldout` (the same seeded training split as `VGG_multi_Strategy.py --val_split heldout`)
+- `--heldout_size` (optional): Training images held out with `--val_split heldout` (default: 5000)
+
+**Note on the paper's VGG-11 scores:** the VGG-11 run in the paper used externally provided sensitivity scores, not this script. This script uses the same defaults as `resnet_sensitivity_simple.py` (batch 32, 50 batches, product metric), so its scores are not expected to reproduce the paper's VGG-11 results exactly.
 
 #### Step 2: Run Multi-Strategy Pruning
 
@@ -208,12 +223,28 @@ python VGG_multi_Strategy.py \
 ```
 
 **Arguments:**
-- `--checkpoint` (required): Path to pretrained VGG-11 checkpoint
+- `--checkpoint` (required): Path to pretrained VGG-11 checkpoint, loaded with `strict=True` into `core/models.py` `vgg11_bn`
 - `--score_dir` (required): Directory containing sensitivity scores
+- `--model` (optional): Model from `core/models.py` (default: `vgg11_bn`)
 - `--data_path` (optional): Path to CIFAR-10 data (default: `./data`)
 - `--batch_size` (optional): Batch size for training/evaluation (default: 128)
+- `--epochs` (optional): Maximum fine-tuning epochs per strategy, with early stopping (default: 20)
 - `--device` (optional): Device to use - `cuda` or `cpu` (default: `cuda`)
 - `--output_dir` (optional): Directory to save pruned models (default: `pruned_models/vgg`)
+- `--seed` (optional): Random seed (default: 42)
+- `--ratios` (optional): Comma-separated pruning percentages (0–100), one per prunable layer, in the order the script prints as `Layer order (for --ratios)` (ascending mean of the first 1000 scores of each layer, as in `get_layer_info`). Runs this single custom strategy (`strategy_1_custom_<hash>`) instead of the 10 default strategies; a wrong number of values is an error that lists the expected layers. The saved `strategy` field records each layer with its percentage, e.g. `custom (classifier.3.weight=50, ...)`. Without it, the default strategy list runs unchanged.
+- `--val_split` (optional): Split used for validation, early stopping, the reported accuracies and INT8 calibration: `test` (CIFAR-10 test set, default, as before) or `heldout` (a seeded split of the training set; the rest is used for fine-tuning)
+- `--heldout_size` (optional): Training images held out with `--val_split heldout` (default: 5000)
+- `--subset_size` (optional): Smoke tests only; use the first N images of each split (default: all)
+
+Example with one custom strategy and a held-out validation split:
+```bash
+python VGG_multi_Strategy.py \
+    --checkpoint checkpoints/vgg11_cifar10.pth \
+    --score_dir ./vgg_scores \
+    --val_split heldout --heldout_size 5000 --seed 0 \
+    --ratios 50,50,50,50,50,50,50,50,50,50,50
+```
 
 **Saved files** (one pair per strategy):
 ```
