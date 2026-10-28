@@ -251,6 +251,7 @@ def fine_tune_model(model, masks, train_loader, val_loader, device, epochs=30):
                 
             loss = criterion(output, target)
             loss.backward()
+            optimizer.step()
             
             with torch.no_grad():
                 for name, param in model.named_parameters():
@@ -258,8 +259,6 @@ def fine_tune_model(model, masks, train_loader, val_loader, device, epochs=30):
                         mask = masks[name]
                         if mask.numel() == param.numel():
                             param.data.mul_(mask.view(param.shape).to(param.device))
-            
-            optimizer.step()
         
         model.eval()
         val_accuracy = evaluate_model(model, val_loader, device)
@@ -428,6 +427,7 @@ def main():
 
         ft_acc = fine_tune_model(model, masks, train_loader, val_loader, device, epochs=args.epochs)
         print(f"  Fine-tuned Accuracy: {ft_acc:.2f}%")
+        print(f"  Sparsity after fine-tuning: {calculate_sparsity(model):.2f}%")
 
         model_int8 = apply_ptq(copy.deepcopy(model).cpu(), val_loader, 'cpu')
         int8_acc = evaluate_model(model_int8, val_loader, 'cpu')
