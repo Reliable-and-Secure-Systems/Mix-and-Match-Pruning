@@ -365,11 +365,11 @@ def fine_tune_model(model, masks, train_loader, test_loader, device, epochs):
             output = model(data)
             loss = criterion(output, target)
             loss.backward()
+            optimizer.step()
             with torch.no_grad():
                 for name, param in model.named_parameters():
                     if name in masks:
                         param.data.mul_(masks[name].to(param.device))
-            optimizer.step()
         test_acc = evaluate_model(model, test_loader, device)
         if test_acc > best_accuracy:
             best_accuracy = test_acc
