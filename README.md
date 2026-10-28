@@ -235,6 +235,7 @@ python VGG_multi_Strategy.py \
 - `--ratios` (optional): Comma-separated pruning percentages (0–100), one per prunable layer, in the order the script prints as `Layer order (for --ratios)` (ascending mean of the first 1000 scores of each layer, as in `get_layer_info`). Runs this single custom strategy (`strategy_1_custom_<hash>`) instead of the 10 default strategies; a wrong number of values is an error that lists the expected layers. The saved `strategy` field records each layer with its percentage, e.g. `custom (classifier.3.weight=50, ...)`. Without it, the default strategy list runs unchanged.
 - `--val_split` (optional): Split used for validation, early stopping, the reported accuracies and INT8 calibration: `test` (CIFAR-10 test set, default, as before) or `heldout` (a seeded split of the training set; the rest is used for fine-tuning)
 - `--heldout_size` (optional): Training images held out with `--val_split heldout` (default: 5000)
+- `--skip_ptq` (optional): Skip the INT8 PTQ step for strategies and baselines; `int8_accuracy` is saved as `None` and no `_int8.pth` is written (default: off). `_fp32.pth` is always written before the PTQ step.
 - `--subset_size` (optional): Smoke tests only; use the first N images of each split (default: all)
 
 Example with one custom strategy and a held-out validation split:

@@ -84,6 +84,8 @@ def parse_args():
     parser.add_argument('--heldout_size', type=int, default=DEFAULT_HELDOUT_SIZE,
                         help=f'Training images held out for validation with --val_split heldout '
                              f'(default: {DEFAULT_HELDOUT_SIZE})')
+    parser.add_argument('--skip_ptq', action='store_true',
+                        help='Skip the INT8 PTQ step (strategies and baselines); INT8 results are recorded as None')
     parser.add_argument('--subset_size', type=int, default=None,
                         help='Smoke tests only: use the first N images of each split (default: all)')
     return parser.parse_args()
@@ -433,6 +435,10 @@ def parse_ratios(ratios: str, layer_names: List[str]) -> List[float]:
             raise ValueError(f"--ratios value for {name} must be between 0 and 100, got {value}")
     return values
 
+def fmt_acc(value, width=0):
+    """Format an accuracy; None (PTQ skipped) prints as n/a"""
+    return f"{'n/a':<{width}}" if value is None else f"{value:<{width}.2f}"
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -538,7 +544,7 @@ def main():
                 ckpt = torch.load(fp32_path, map_location='cpu')
                 results.append({'strategy': ckpt['strategy'], 'sparsity': ckpt['sparsity'],
                                  'ft_acc': ckpt['fp32_accuracy'], 'int8_acc': ckpt['int8_accuracy'],
-                                 'drop': initial_acc - ckpt['int8_accuracy']})
+                                 'drop': None if ckpt['int8_accuracy'] is None else initial_acc - ckpt['int8_accuracy']})
             continue
 
         # Create strategy
@@ -562,22 +568,31 @@ def main():
         ft_acc = fine_tune_model(model, masks, train_loader, val_loader, device, epochs=args.epochs)
         print(f"  Fine-tuned FP32 Accuracy: {ft_acc:.2f}%")
 
-        # Apply PTQ
-        model_int8 = apply_ptq(copy.deepcopy(model).cpu(), val_loader, 'cpu')
-        int8_acc = evaluate_model(model_int8, val_loader, 'cpu')
-        print(f"  INT8 Accuracy: {int8_acc:.2f}%")
-
-        # --- SAVE MODELS ---
+        # --- SAVE FP32 MODEL (before PTQ, so it exists even if PTQ fails or is skipped) ---
         fp32_path = os.path.join(args.output_dir, f'{strategy_id}_fp32.pth')
         int8_path = os.path.join(args.output_dir, f'{strategy_id}_int8.pth')
-        torch.save({
+        fp32_record = {
             'strategy': desc, 'strategy_type': strategy_type, 'sparsity': sparsity,
-            'fp32_accuracy': ft_acc, 'int8_accuracy': int8_acc,
+            'fp32_accuracy': ft_acc, 'int8_accuracy': None,
             'state_dict': model.state_dict(), 'masks': masks
-        }, fp32_path)
-        torch.save(model_int8, int8_path)
+        }
+        torch.save(fp32_record, fp32_path)
         print(f"  Saved FP32 → {fp32_path}")
-        print(f"  Saved INT8 → {int8_path}")
+
+        # Apply PTQ
+        if args.skip_ptq:
+            int8_acc = None
+            print("  INT8 PTQ skipped (--skip_ptq)")
+        else:
+            model_int8 = apply_ptq(copy.deepcopy(model).cpu(), val_loader, 'cpu')
+            int8_acc = evaluate_model(model_int8, val_loader, 'cpu')
+            print(f"  INT8 Accuracy: {int8_acc:.2f}%")
+
+            # --- SAVE INT8 MODEL; add the INT8 accuracy to the FP32 record ---
+            fp32_record['int8_accuracy'] = int8_acc
+            torch.save(fp32_record, fp32_path)
+            torch.save(model_int8, int8_path)
+            print(f"  Saved INT8 → {int8_path}")
         savepoint['completed'].append(strategy_id)
         with open(savepoint_file, 'w') as f:
             json.dump(savepoint, f, indent=2)
@@ -587,7 +602,7 @@ def main():
             'sparsity': sparsity,
             'ft_acc': ft_acc,
             'int8_acc': int8_acc,
-            'drop': initial_acc - int8_acc
+            'drop': None if int8_acc is None else initial_acc - int8_acc
         })
 
     # Baseline comparisons
@@ -601,6 +616,13 @@ def main():
 
     baseline_results = []
 
+    def ptq_accuracy(model):
+        """INT8 accuracy after PTQ, or None with --skip_ptq"""
+        if args.skip_ptq:
+            return None
+        model_int8 = apply_ptq(copy.deepcopy(model).cpu(), val_loader, 'cpu')
+        return evaluate_model(model_int8, val_loader, 'cpu')
+
     # Random Pruning
     print("\nBaseline 1: Random Pruning")
     model = copy.deepcopy(base_model)
@@ -608,9 +630,8 @@ def main():
     model = random_pruner.prune(target_sparsity / 100.0)
     sparsity = calculate_sparsity(model)
     fp32_acc = evaluate_model(model, val_loader, device)
-    model_int8 = apply_ptq(copy.deepcopy(model).cpu(), val_loader, 'cpu')
-    int8_acc = evaluate_model(model_int8, val_loader, 'cpu')
-    print(f"  Sparsity: {sparsity:.2f}% | FP32: {fp32_acc:.2f}% | INT8: {int8_acc:.2f}%")
+    int8_acc = ptq_accuracy(model)
+    print(f"  Sparsity: {sparsity:.2f}% | FP32: {fp32_acc:.2f}% | INT8: {fmt_acc(int8_acc)}")
     baseline_results.append({'name': 'Random', 'sparsity': sparsity, 'fp32': fp32_acc, 'int8': int8_acc})
 
     # Magnitude Pruning
@@ -620,9 +641,8 @@ def main():
     model = mag_pruner.prune(target_sparsity / 100.0)
     sparsity = calculate_sparsity(model)
     fp32_acc = evaluate_model(model, val_loader, device)
-    model_int8 = apply_ptq(copy.deepcopy(model).cpu(), val_loader, 'cpu')
-    int8_acc = evaluate_model(model_int8, val_loader, 'cpu')
-    print(f"  Sparsity: {sparsity:.2f}% | FP32: {fp32_acc:.2f}% | INT8: {int8_acc:.2f}%")
+    int8_acc = ptq_accuracy(model)
+    print(f"  Sparsity: {sparsity:.2f}% | FP32: {fp32_acc:.2f}% | INT8: {fmt_acc(int8_acc)}")
     baseline_results.append({'name': 'MAG', 'sparsity': sparsity, 'fp32': fp32_acc, 'int8': int8_acc})
 
     # SNIP
@@ -632,9 +652,8 @@ def main():
     model = snip_pruner.prune(target_sparsity / 100.0)
     sparsity = calculate_sparsity(model)
     fp32_acc = evaluate_model(model, val_loader, device)
-    model_int8 = apply_ptq(copy.deepcopy(model).cpu(), val_loader, 'cpu')
-    int8_acc = evaluate_model(model_int8, val_loader, 'cpu')
-    print(f"  Sparsity: {sparsity:.2f}% | FP32: {fp32_acc:.2f}% | INT8: {int8_acc:.2f}%")
+    int8_acc = ptq_accuracy(model)
+    print(f"  Sparsity: {sparsity:.2f}% | FP32: {fp32_acc:.2f}% | INT8: {fmt_acc(int8_acc)}")
     baseline_results.append({'name': 'SNIP', 'sparsity': sparsity, 'fp32': fp32_acc, 'int8': int8_acc})
 
     # GraSP
@@ -644,9 +663,8 @@ def main():
     model = grasp_pruner.prune(target_sparsity / 100.0)
     sparsity = calculate_sparsity(model)
     fp32_acc = evaluate_model(model, val_loader, device)
-    model_int8 = apply_ptq(copy.deepcopy(model).cpu(), val_loader, 'cpu')
-    int8_acc = evaluate_model(model_int8, val_loader, 'cpu')
-    print(f"  Sparsity: {sparsity:.2f}% | FP32: {fp32_acc:.2f}% | INT8: {int8_acc:.2f}%")
+    int8_acc = ptq_accuracy(model)
+    print(f"  Sparsity: {sparsity:.2f}% | FP32: {fp32_acc:.2f}% | INT8: {fmt_acc(int8_acc)}")
     baseline_results.append({'name': 'GraSP', 'sparsity': sparsity, 'fp32': fp32_acc, 'int8': int8_acc})
 
     # Final summary
@@ -658,11 +676,13 @@ def main():
     print(f"{'Strategy':<30} | {'Sparsity':<10} | {'FT Acc':<10} | {'INT8 Acc':<10} | {'Drop':<10}")
     print("-" * 80)
     for res in results:
-        print(f"{res['strategy']:<30} | {res['sparsity']:<10.2f} | {res['ft_acc']:<10.2f} | {res['int8_acc']:<10.2f} | {res['drop']:<10.2f}")
+        print(f"{res['strategy']:<30} | {res['sparsity']:<10.2f} | {res['ft_acc']:<10.2f} | {fmt_acc(res['int8_acc'], 10)} | {fmt_acc(res['drop'], 10)}")
 
     print("\nMulti-Strategy Statistics:")
-    int8_accs = [r['int8_acc'] for r in results]
-    drops = [r['drop'] for r in results]
+    int8_accs = [r['int8_acc'] for r in results if r['int8_acc'] is not None]
+    drops = [r['drop'] for r in results if r['drop'] is not None]
+    if not int8_accs:
+        int8_accs = drops = [float('nan')]  # PTQ skipped
     print(f"  Mean INT8 Accuracy: {np.mean(int8_accs):.2f}% ± {np.std(int8_accs):.2f}%")
     print(f"  Mean Accuracy Drop: {np.mean(drops):.2f}% ± {np.std(drops):.2f}%")
     print(f"  Best INT8 Accuracy: {np.max(int8_accs):.2f}%")
@@ -672,7 +692,7 @@ def main():
     print(f"{'Method':<15} | {'Sparsity':<10} | {'FP32 Acc':<10} | {'INT8 Acc':<10}")
     print("-" * 60)
     for res in baseline_results:
-        print(f"{res['name']:<15} | {res['sparsity']:<10.2f} | {res['fp32']:<10.2f} | {res['int8']:<10.2f}")
+        print(f"{res['name']:<15} | {res['sparsity']:<10.2f} | {res['fp32']:<10.2f} | {fmt_acc(res['int8'], 10)}")
 
     print("\n" + "=" * 80)
 
