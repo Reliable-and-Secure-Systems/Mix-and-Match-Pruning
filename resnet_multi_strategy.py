@@ -756,7 +756,7 @@ def main():
     # Evaluate each baseline
     for baseline_name in ["MAG", "SNIP", "GraSP", "Random"]:
         baseline_model, baseline_masks, fp32_acc, actual_spar = apply_baseline_pruning(
-            baseline_name, CHECKPOINT_PATH, mean_sparsity,
+            baseline_name, args.checkpoint, mean_sparsity,
             train_loader, test_loader, device
         )
 
