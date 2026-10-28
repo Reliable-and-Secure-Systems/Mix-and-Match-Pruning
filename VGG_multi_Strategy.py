@@ -84,6 +84,8 @@ def parse_args():
     parser.add_argument('--heldout_size', type=int, default=DEFAULT_HELDOUT_SIZE,
                         help=f'Training images held out for validation with --val_split heldout '
                              f'(default: {DEFAULT_HELDOUT_SIZE})')
+    parser.add_argument('--skip_baselines', action='store_true',
+                        help='Skip the baseline comparison (Random, MAG, SNIP, GraSP); exit after the strategies are saved')
     parser.add_argument('--skip_ptq', action='store_true',
                         help='Skip the INT8 PTQ step (strategies and baselines); INT8 results are recorded as None')
     parser.add_argument('--subset_size', type=int, default=None,
@@ -604,6 +606,10 @@ def main():
             'int8_acc': int8_acc,
             'drop': None if int8_acc is None else initial_acc - int8_acc
         })
+
+    if args.skip_baselines:
+        print(f"\nBaselines skipped (--skip_baselines); strategy outputs are in {args.output_dir}")
+        return
 
     # Baseline comparisons
     print("\n" + "=" * 80)
