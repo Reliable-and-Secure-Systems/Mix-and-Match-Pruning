@@ -42,6 +42,7 @@ from core.models import vgg11_bn
 # Configuration
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_FINE_TUNE_EPOCHS = 20
+DEFAULT_PATIENCE = 3
 DEFAULT_HELDOUT_SIZE = 5000
 SEED = 42
 
@@ -68,6 +69,11 @@ def parse_args():
                         help=f'Batch size for training/evaluation (default: {DEFAULT_BATCH_SIZE})')
     parser.add_argument('--epochs', type=int, default=DEFAULT_FINE_TUNE_EPOCHS,
                         help=f'Fine-tuning epochs (default: {DEFAULT_FINE_TUNE_EPOCHS})')
+    parser.add_argument('--patience', type=int, default=DEFAULT_PATIENCE,
+                        help=f'Early stopping: epochs without a validation improvement before stopping '
+                             f'(default: {DEFAULT_PATIENCE}); set it to --epochs or more to disable early stopping')
+    parser.add_argument('--min_epochs', type=int, default=0,
+                        help='Early stopping never stops before this many epochs (default: 0 = no minimum)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use: cuda or cpu (default: cuda if available)')
     parser.add_argument('--output_dir', type=str, default='pruned_models/vgg',
@@ -318,18 +324,25 @@ def apply_pruning_mask(model, strategy, layer_names, layer_params, score_dir, de
 
     return masks
 
-def fine_tune_model(model, masks, train_loader, val_loader, device, epochs=20):
-    """Fine-tune pruned model with early stopping"""
+def fine_tune_model(model, masks, train_loader, val_loader, device, epochs=20, patience=DEFAULT_PATIENCE,
+                    min_epochs=0):
+    """Fine-tune pruned model with early stopping.
+
+    Stops after `patience` epochs without a validation improvement, but not before `min_epochs` epochs, and
+    restores the best epoch. Prints one line per epoch (training loss, validation accuracy, best so far).
+    """
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.CrossEntropyLoss()
 
     best_accuracy = 0.0
+    best_epoch = 0
     patience_counter = 0
-    patience = 3
     best_model_state = None
 
     for epoch in range(epochs):
         model.train()
+        loss_sum = torch.zeros((), device=device)   # summed on the device: no extra synchronization per batch
+        seen = 0
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
 
@@ -338,6 +351,8 @@ def fine_tune_model(model, masks, train_loader, val_loader, device, epochs=20):
             loss = criterion(output, target)
             loss.backward()
             optimizer.step()
+            loss_sum += loss.detach() * target.size(0)
+            seen += target.size(0)
 
             # Enforce sparsity after gradient update
             with torch.no_grad():
@@ -351,14 +366,20 @@ def fine_tune_model(model, masks, train_loader, val_loader, device, epochs=20):
         model.eval()
         val_accuracy = evaluate_model(model, val_loader, device)
 
-        if val_accuracy > best_accuracy:
+        improved = val_accuracy > best_accuracy
+        if improved:
             best_accuracy = val_accuracy
+            best_epoch = epoch + 1
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
             patience_counter += 1
-            if patience_counter >= patience:
-                break
+        print(f"    Epoch {epoch + 1}/{epochs}: train loss {loss_sum.item() / max(seen, 1):.4f}, "
+              f"val acc {val_accuracy:.2f}%, best {best_accuracy:.2f}% (epoch {best_epoch})", flush=True)
+        if not improved and patience_counter >= patience and epoch + 1 >= min_epochs:
+            break
+
+    print(f"    Fine-tuning ran {epoch + 1 if epochs > 0 else 0} epochs, kept epoch {best_epoch}", flush=True)
 
     # Restore best model
     if best_model_state is not None:
@@ -566,7 +587,8 @@ def main():
         print(f"  Sparsity: {sparsity:.2f}%")
 
         # Fine-tune
-        ft_acc = fine_tune_model(model, masks, train_loader, val_loader, device, epochs=args.epochs)
+        ft_acc = fine_tune_model(model, masks, train_loader, val_loader, device, epochs=args.epochs,
+                                 patience=args.patience, min_epochs=args.min_epochs)
         print(f"  Fine-tuned FP32 Accuracy: {ft_acc:.2f}%")
         print(f"  Sparsity after fine-tuning: {calculate_sparsity(model):.2f}%")
 
